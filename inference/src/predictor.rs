@@ -8,7 +8,7 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use sentencepiece::SentencePieceProcessor;
 
-pub(crate) const CONTEXT_LEN: usize = 8;
+pub(crate) const CONTEXT_LEN: usize = 16;
 
 pub(crate) const NUM_SPECIAL_TOKENS: usize = 4;
 

@@ -41,8 +41,8 @@ def get_device() -> torch.device:
         if torch.backends.mps.is_built():
             print("✓ Using MPS (Metal Performance Shaders) on Apple Silicon")
             # Set MPS-specific optimizations
-            # Use high watermark ratio to reduce memory fragmentation
             os.environ.setdefault('PYTORCH_MPS_HIGH_WATERMARK_RATIO', '0.0')
+            os.environ.setdefault('PYTORCH_MPS_FAST_MATH', '1')
             return torch.device("mps")
     
     if torch.cuda.is_available():
@@ -71,8 +71,10 @@ def empty_mps_cache(device: torch.device):
 
 class BanglaSentencePieceTokenizer:
     """SentencePiece-based tokenizer for Bangla text"""
-    
+
     BANGLA_PATTERN = re.compile(r'[\u0980-\u09FF]+')
+    # Bengali sentence boundaries: danda, double danda, and common punctuation
+    SENTENCE_SPLIT = re.compile(r'[।\u0965.!?\n]+')
     
     def __init__(self, vocab_size: int = 16000, model_type: str = "bpe"):
         """
@@ -89,20 +91,30 @@ class BanglaSentencePieceTokenizer:
         """Extract only Bangla text for training"""
         words = self.BANGLA_PATTERN.findall(str(text))
         return ' '.join(words)
+
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences at Bengali danda, double danda, and punctuation."""
+        parts = self.SENTENCE_SPLIT.split(str(text))
+        sentences = []
+        for part in parts:
+            cleaned = self._preprocess_text(part)
+            if cleaned.strip() and len(cleaned.strip()) > 5:
+                sentences.append(cleaned.strip())
+        return sentences
     
     def train(self, texts: List[str], model_dir: str = ".") -> 'BanglaSentencePieceTokenizer':
         """Train SentencePiece model on texts"""
         print("Training SentencePiece tokenizer...")
         
-        # Create temporary file with training data
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, 
+        # Create temporary file with training data (one sentence per line)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
                                           encoding='utf-8') as f:
             train_file = f.name
             processed_count = 0
             for i, text in enumerate(texts):
-                processed = self._preprocess_text(text)
-                if processed.strip():
-                    f.write(processed + '\n')
+                sentences = self._split_into_sentences(text)
+                for sent in sentences:
+                    f.write(sent + '\n')
                     processed_count += 1
                 if (i + 1) % 10000 == 0:
                     print(f"  Processed {i + 1:,} texts for tokenizer training...")
@@ -134,6 +146,7 @@ class BanglaSentencePieceTokenizer:
             split_by_whitespace=True,
             add_dummy_prefix=False,  # Don't add leading space
             normalization_rule_name='identity',  # Preserve Bangla text as-is
+            max_sentence_length=16384,  # Safety net for long sentences
             num_threads=os.cpu_count() or 4,
             train_extremely_large_corpus=False,
         )
@@ -258,52 +271,59 @@ def make_sequences(tokens: List[int], context_len: int) -> List[Tuple[List[int],
 class NextWordGRU(nn.Module):
     """
     GRU-based next word prediction model
-    
+
     GRU advantages over LSTM:
     - Fewer parameters (2 gates vs 3 gates) -> faster training
     - Often similar performance to LSTM
     - Better gradient flow for shorter sequences
     - More memory efficient
     """
-    
+
     def __init__(
-        self, 
-        vocab_size: int, 
-        emb_dim: int = 256, 
-        hid_dim: int = 512, 
-        n_layers: int = 2, 
-        dropout: float = 0.3
+        self,
+        vocab_size: int,
+        emb_dim: int = 192,
+        hid_dim: int = 384,
+        n_layers: int = 2,
+        dropout: float = 0.3,
+        weight_tying: bool = True,
     ):
         super().__init__()
-        
+
+        self.weight_tying = weight_tying
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
-        
-        # GRU instead of LSTM
-        # GRU has only hidden state (no cell state)
+
         self.gru = nn.GRU(
             input_size=emb_dim,
             hidden_size=hid_dim,
             num_layers=n_layers,
             batch_first=True,
             dropout=dropout if n_layers > 1 else 0,
-            bidirectional=False
+            bidirectional=False,
         )
-        
+
         self.drop = nn.Dropout(dropout)
-        self.fc = nn.Linear(hid_dim, vocab_size)
-        
-        # Initialize weights (important for GRU stability)
+        self.layer_norm = nn.LayerNorm(hid_dim)
+
+        if weight_tying:
+            # Project hid_dim -> emb_dim, then reuse embedding weight for output
+            if hid_dim != emb_dim:
+                self.proj = nn.Linear(hid_dim, emb_dim, bias=False)
+            else:
+                self.proj = nn.Identity()
+            self.output_bias = nn.Parameter(torch.zeros(vocab_size))
+        else:
+            self.proj = None
+            self.fc = nn.Linear(hid_dim, vocab_size)
+
         self._init_weights()
-    
+
     def _init_weights(self):
         """Initialize weights for better convergence"""
-        # Embedding initialization
         nn.init.normal_(self.emb.weight, mean=0, std=0.1)
-        # Zero out padding embedding
         with torch.no_grad():
             self.emb.weight[0].fill_(0)
-        
-        # GRU weight initialization (orthogonal for recurrent weights)
+
         for name, param in self.gru.named_parameters():
             if 'weight_ih' in name:
                 nn.init.xavier_uniform_(param)
@@ -311,34 +331,34 @@ class NextWordGRU(nn.Module):
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
-        
-        # Output layer
-        nn.init.xavier_uniform_(self.fc.weight)
-        nn.init.zeros_(self.fc.bias)
-    
+
+        if self.weight_tying:
+            if hasattr(self.proj, 'weight'):
+                nn.init.xavier_uniform_(self.proj.weight)
+            nn.init.zeros_(self.output_bias)
+        else:
+            nn.init.xavier_uniform_(self.fc.weight)
+            nn.init.zeros_(self.fc.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass
-        
+
         Args:
             x: Input tensor of shape (batch_size, seq_len)
-        
+
         Returns:
             Logits of shape (batch_size, vocab_size)
         """
-        # Embed: (batch, seq) -> (batch, seq, emb_dim)
         embedded = self.drop(self.emb(x))
-        
-        # GRU: (batch, seq, emb) -> (batch, seq, hid)
-        # Note: GRU returns (output, h_n) where h_n is final hidden state
-        # LSTM returns (output, (h_n, c_n)) - GRU has no cell state
         output, _ = self.gru(embedded)
-        
-        # Take last timestep and apply dropout
-        last_hidden = self.drop(output[:, -1, :])
-        
-        # Project to vocabulary
-        return self.fc(last_hidden)
+        last_hidden = self.drop(self.layer_norm(output[:, -1, :]))
+
+        if self.weight_tying:
+            projected = self.proj(last_hidden)
+            return F.linear(projected, self.emb.weight, self.output_bias)
+        else:
+            return self.fc(last_hidden)
     
     def predict_topk(
         self, 
@@ -474,13 +494,16 @@ def train_epoch(
     
     running_loss = 0.0
     
+    use_amp = device.type == "mps"
+
     for batch_idx, (ctx, tgt) in enumerate(pbar):
         ctx, tgt = ctx.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
-        
-        # Forward pass
-        logits = model(ctx)
-        loss = criterion(logits, tgt)
-        
+
+        # Forward pass with optional float16 autocast on MPS
+        with torch.amp.autocast("mps", dtype=torch.float16, enabled=use_amp):
+            logits = model(ctx)
+            loss = criterion(logits, tgt)
+
         # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
         loss.backward()
@@ -538,19 +561,22 @@ def evaluate(
     else:
         pbar = loader
     
+    use_amp = device.type == "mps"
+
     for ctx, tgt in pbar:
         ctx, tgt = ctx.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
-        
-        out = model(ctx)
-        total_loss += criterion(out, tgt).item()
-        
+
+        with torch.amp.autocast("mps", dtype=torch.float16, enabled=use_amp):
+            out = model(ctx)
+            total_loss += criterion(out, tgt).item()
+
         # Top-1 accuracy
         correct += (out.argmax(-1) == tgt).sum().item()
-        
+
         # Top-5 accuracy
         _, top5 = out.topk(5, dim=-1)
         correct_top5 += (top5 == tgt.unsqueeze(1)).any(-1).sum().item()
-        
+
         total += tgt.size(0)
     
     if show_progress:
@@ -560,6 +586,88 @@ def evaluate(
     sync_mps(device)
     
     return total_loss / len(loader), correct / total, correct_top5 / total
+
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+
+def save_checkpoint(
+    checkpoint_dir: str,
+    epoch: int,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler,
+    best_loss: float,
+    history: dict,
+    args,
+    is_best: bool = False,
+):
+    """Save full training checkpoint for resume capability."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_loss': best_loss,
+        'history': history,
+        'args': vars(args),
+        'rng_state': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.random.get_rng_state(),
+        },
+    }
+
+    # Save per-epoch checkpoint (keep all)
+    path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch:03d}.pt')
+    torch.save(checkpoint, path)
+
+    # Save 'latest' for easy resume
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pt')
+    torch.save(checkpoint, latest_path)
+
+    # Save best model separately
+    if is_best:
+        best_path = os.path.join(checkpoint_dir, 'checkpoint_best.pt')
+        torch.save(checkpoint, best_path)
+
+    print(f"         └─ Checkpoint saved: epoch {epoch}" +
+          (" [best]" if is_best else ""))
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler,
+    device: torch.device,
+) -> Tuple[int, float, dict]:
+    """Load checkpoint and restore all training state. Returns (epoch, best_loss, history)."""
+    # If path is a directory, load checkpoint_latest.pt
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = os.path.join(checkpoint_path, 'checkpoints', 'checkpoint_latest.pt')
+
+    print(f"Resuming from {checkpoint_path}...")
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.to(device)
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+    # Restore RNG states for reproducibility
+    rng = ckpt.get('rng_state', {})
+    if 'python' in rng:
+        random.setstate(rng['python'])
+    if 'numpy' in rng:
+        np.random.set_state(rng['numpy'])
+    if 'torch' in rng:
+        torch.random.set_rng_state(rng['torch'])
+
+    return ckpt['epoch'], ckpt['best_loss'], ckpt['history']
 
 
 # =============================================================================
@@ -704,72 +812,98 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     # =================================================================
-    # Load Data
+    # Load Data & Tokenizer (with resume support)
     # =================================================================
-    print("\n" + "=" * 70)
-    print(" STEP 1: Loading Data")
-    print("=" * 70)
-    
-    texts = load_bangla_data(max_samples=args.max_samples)
-    
-    if len(texts) == 0:
-        print("ERROR: No texts loaded!")
-        return
-    
-    # =================================================================
-    # Train SentencePiece Tokenizer
-    # =================================================================
-    print("\n" + "=" * 70)
-    print(" STEP 2: Training SentencePiece Tokenizer")
-    print("=" * 70)
-    
-    tokenizer = BanglaSentencePieceTokenizer(
-        vocab_size=args.vocab_size,
-        model_type=args.sp_model_type
-    )
-    tokenizer.train(texts, model_dir=args.output_dir)
-    
-    # Show sample tokenization
-    print("\nSample tokenization:")
-    sample_texts = ["আমি বাংলায় গান গাই", "বাংলাদেশের রাজধানী ঢাকা"]
-    for text in sample_texts:
-        pieces = tokenizer.tokenize(text)
-        ids = tokenizer.encode(text)
-        print(f"  '{text}'")
-        print(f"    → Pieces: {pieces}")
-        print(f"    → IDs: {ids}")
-    
-    vocab_size = tokenizer.vocab_size_actual
-    print(f"\n✓ Vocabulary size: {vocab_size:,}")
-    
-    # =================================================================
-    # Create Sequences
-    # =================================================================
-    print("\n" + "=" * 70)
-    print(" STEP 3: Creating Training Sequences")
-    print("=" * 70)
-    
-    all_seqs = []
-    for i, text in enumerate(texts):
-        tokens = tokenizer.encode(text)
-        if len(tokens) > args.context_len:
-            seqs = make_sequences(tokens, args.context_len)
-            all_seqs.extend(seqs)
-        
-        if (i + 1) % 10000 == 0:
-            print(f"  Processed {i + 1:,} texts, sequences: {len(all_seqs):,}")
-    
-    print(f"\n✓ Total sequences: {len(all_seqs):,}")
-    
-    if len(all_seqs) == 0:
-        print("ERROR: No sequences created!")
-        return
-    
-    # Split data
-    random.shuffle(all_seqs)
-    val_size = int(len(all_seqs) * args.val_split)
-    train_seqs = all_seqs[val_size:]
-    val_seqs = all_seqs[:val_size]
+    sequences_path = os.path.join(args.output_dir, 'sequences.pt')
+    tokenizer_path = os.path.join(args.output_dir, 'sp_bangla')
+
+    if args.resume and os.path.exists(sequences_path) and os.path.exists(f"{tokenizer_path}.model"):
+        # Fast resume: load cached tokenizer + sequences
+        print("\n" + "=" * 70)
+        print(" RESUMING: Loading cached tokenizer and sequences")
+        print("=" * 70)
+
+        tokenizer = BanglaSentencePieceTokenizer.load(tokenizer_path)
+        vocab_size = tokenizer.vocab_size_actual
+        print(f"  ✓ Loaded tokenizer ({vocab_size:,} tokens)")
+
+        saved = torch.load(sequences_path, weights_only=False)
+        train_seqs = saved['train']
+        val_seqs = saved['val']
+        print(f"  ✓ Loaded {len(train_seqs):,} train + {len(val_seqs):,} val sequences")
+    else:
+        # Full pipeline: load data, train tokenizer, create sequences
+        print("\n" + "=" * 70)
+        print(" STEP 1: Loading Data")
+        print("=" * 70)
+
+        texts = load_bangla_data(max_samples=args.max_samples)
+
+        if len(texts) == 0:
+            print("ERROR: No texts loaded!")
+            return
+
+        # =================================================================
+        # Train SentencePiece Tokenizer
+        # =================================================================
+        print("\n" + "=" * 70)
+        print(" STEP 2: Training SentencePiece Tokenizer")
+        print("=" * 70)
+
+        tokenizer = BanglaSentencePieceTokenizer(
+            vocab_size=args.vocab_size,
+            model_type=args.sp_model_type,
+        )
+        tokenizer.train(texts, model_dir=args.output_dir)
+
+        # Show sample tokenization
+        print("\nSample tokenization:")
+        sample_texts = ["আমি বাংলায় গান গাই", "বাংলাদেশের রাজধানী ঢাকা"]
+        for text in sample_texts:
+            pieces = tokenizer.tokenize(text)
+            ids = tokenizer.encode(text)
+            print(f"  '{text}'")
+            print(f"    → Pieces: {pieces}")
+            print(f"    → IDs: {ids}")
+
+        vocab_size = tokenizer.vocab_size_actual
+        print(f"\n✓ Vocabulary size: {vocab_size:,}")
+
+        # =================================================================
+        # Create Sequences
+        # =================================================================
+        print("\n" + "=" * 70)
+        print(" STEP 3: Creating Training Sequences")
+        print("=" * 70)
+
+        all_seqs = []
+        for i, text in enumerate(texts):
+            # Encode per-sentence to avoid cross-topic context leaking
+            sentences = tokenizer._split_into_sentences(text)
+            for sent in sentences:
+                tokens = tokenizer.encode(sent)
+                if len(tokens) > args.context_len:
+                    seqs = make_sequences(tokens, args.context_len)
+                    all_seqs.extend(seqs)
+
+            if (i + 1) % 10000 == 0:
+                print(f"  Processed {i + 1:,} texts, sequences: {len(all_seqs):,}")
+
+        print(f"\n✓ Total sequences: {len(all_seqs):,}")
+
+        if len(all_seqs) == 0:
+            print("ERROR: No sequences created!")
+            return
+
+        # Split data
+        random.shuffle(all_seqs)
+        val_size = int(len(all_seqs) * args.val_split)
+        train_seqs = all_seqs[val_size:]
+        val_seqs = all_seqs[:val_size]
+
+        # Cache sequences for fast resume
+        print(f"  Caching sequences to {sequences_path}...")
+        torch.save({'train': train_seqs, 'val': val_seqs}, sequences_path)
     
     # Create data loaders
     # MPS best practices:
@@ -806,9 +940,10 @@ def main(args):
         emb_dim=args.emb_dim,
         hid_dim=args.hid_dim,
         n_layers=args.n_layers,
-        dropout=args.dropout
+        dropout=args.dropout,
+        weight_tying=args.weight_tying,
     )
-    
+
     # Move to device and ensure float32 (MPS has limited float16 support)
     model = model.to(device=device, dtype=torch.float32)
     
@@ -834,80 +969,97 @@ def main(args):
     
     # AdamW with weight decay (better than plain Adam)
     optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=args.lr, 
+        model.parameters(),
+        lr=args.lr,
         weight_decay=0.01,
         betas=(0.9, 0.999),
-        eps=1e-8
+        eps=1e-8,
     )
-    
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min',
-        factor=0.5, 
-        patience=2
+
+    # Cosine annealing with linear warmup
+    warmup_epochs = max(1, args.epochs // 10)
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
     )
-    
-    # Loss function (ignore padding token)
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
-    
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
+
+    # Loss function with label smoothing
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=0, label_smoothing=args.label_smoothing
+    )
+
     # Training history
     history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_top5': []}
     best_loss = float('inf')
     best_state = None
     patience_counter = 0
-    
+    start_epoch = 1
+
     # Gradient accumulation for effective larger batch size
     grad_accum_steps = args.grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps
-    
+
+    # Resume from checkpoint if requested
+    if args.resume:
+        start_epoch, best_loss, history = load_checkpoint(
+            args.resume, model, optimizer, scheduler, device
+        )
+        start_epoch += 1
+        print(f"  Resumed from epoch {start_epoch - 1}, best_loss={best_loss:.4f}")
+
     print(f"\nTraining Configuration:")
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Gradient accumulation: {grad_accum_steps} steps")
     print(f"  Effective batch size: {effective_batch}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  Label smoothing: {args.label_smoothing}")
+    print(f"  Weight tying: {args.weight_tying}")
+    print(f"  LR schedule: warmup({warmup_epochs}) + cosine({args.epochs - warmup_epochs})")
     print("-" * 70)
-    
-    for epoch in range(1, args.epochs + 1):
+
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        
+
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, criterion, device, grad_accum_steps,
-            epoch=epoch, total_epochs=args.epochs, show_progress=True
+            epoch=epoch, total_epochs=args.epochs, show_progress=True,
         )
-        
+
         # Evaluate
-        val_loss, val_acc, val_top5 = evaluate(model, val_loader, criterion, device, show_progress=True)
-        
-        # Update scheduler
-        old_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_loss)
-        new_lr = optimizer.param_groups[0]['lr']
-        
+        val_loss, val_acc, val_top5 = evaluate(
+            model, val_loader, criterion, device, show_progress=True
+        )
+
+        # Step the scheduler (epoch-based, not metric-based)
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Record history
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
         history['val_top5'].append(val_top5)
-        
+
         elapsed = time.time() - t0
-        
+
+        is_best = val_loss < best_loss
         print(f"Epoch {epoch:2d}/{args.epochs} | "
               f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | "
               f"Top1: {val_acc*100:.1f}% | Top5: {val_top5*100:.1f}% | "
-              f"LR: {new_lr:.2e} | {elapsed:.1f}s")
-        
-        # Log LR reduction
-        if new_lr < old_lr:
-            print(f"         └─ LR reduced: {old_lr:.2e} → {new_lr:.2e}")
-        
+              f"LR: {current_lr:.2e} | {elapsed:.1f}s")
+
         # Save best model
-        if val_loss < best_loss:
+        if is_best:
             best_loss = val_loss
-            # Move to CPU for saving to avoid MPS tensor issues
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
             print("         └─ ✓ Best model saved")
@@ -915,17 +1067,32 @@ def main(args):
             patience_counter += 1
             if patience_counter >= args.patience:
                 print(f"\nEarly stopping at epoch {epoch}")
+                # Save final checkpoint before stopping
+                save_checkpoint(
+                    checkpoint_dir=os.path.join(args.output_dir, 'checkpoints'),
+                    epoch=epoch, model=model, optimizer=optimizer,
+                    scheduler=scheduler, best_loss=best_loss,
+                    history=history, args=args, is_best=False,
+                )
                 break
-        
+
+        # Save checkpoint every epoch
+        save_checkpoint(
+            checkpoint_dir=os.path.join(args.output_dir, 'checkpoints'),
+            epoch=epoch, model=model, optimizer=optimizer,
+            scheduler=scheduler, best_loss=best_loss,
+            history=history, args=args, is_best=is_best,
+        )
+
         # Periodic cache clearing for MPS
         if device.type == "mps" and epoch % 5 == 0:
             empty_mps_cache(device)
-    
+
     # Load best model
     if best_state:
         model.load_state_dict(best_state)
         model = model.to(device)
-    
+
     print(f"\n✓ Training complete! Best val loss: {best_loss:.4f}")
     
     # =================================================================
@@ -947,9 +1114,11 @@ def main(args):
             'hid_dim': args.hid_dim,
             'n_layers': args.n_layers,
             'dropout': args.dropout,
+            'weight_tying': args.weight_tying,
+            'label_smoothing': args.label_smoothing,
             'model_type': 'gru',
             'tokenizer_type': 'sentencepiece',
-            'sp_model_type': args.sp_model_type
+            'sp_model_type': args.sp_model_type,
         },
         'history': history
     }, model_path)
@@ -1009,10 +1178,11 @@ def load_and_predict(args):
         emb_dim=config['emb_dim'],
         hid_dim=config['hid_dim'],
         n_layers=config['n_layers'],
-        dropout=config.get('dropout', 0.3)
+        dropout=config.get('dropout', 0.3),
+        weight_tying=config.get('weight_tying', False),
     ).to(device)
     
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(checkpoint['model'], strict=False)
     print(f"✓ Loaded model ({sum(p.numel() for p in model.parameters()):,} parameters)")
     
     # Create predictor
@@ -1047,40 +1217,47 @@ def parse_args():
     # Mode
     parser.add_argument('--load', type=str, default=None,
                         help='Load saved model from directory (skip training)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume training from checkpoint directory')
     parser.add_argument('--text', type=str, default=None,
                         help='Text to predict next word for')
     parser.add_argument('--interactive', action='store_true',
                         help='Run interactive prediction mode')
-    
+
     # Data
     parser.add_argument('--max_samples', type=int, default=50000,
                         help='Max samples per dataset')
-    parser.add_argument('--context_len', type=int, default=8,
-                        help='Context length (previous tokens) - increased for subwords')
-    
+    parser.add_argument('--context_len', type=int, default=16,
+                        help='Context length (previous tokens)')
+
     # Tokenizer (SentencePiece)
-    parser.add_argument('--vocab_size', type=int, default=16000,
+    parser.add_argument('--vocab_size', type=int, default=8000,
                         help='SentencePiece vocabulary size (8000-32000 recommended)')
     parser.add_argument('--sp_model_type', type=str, default='bpe',
                         choices=['bpe', 'unigram'],
                         help='SentencePiece model type')
-    
+
     # Model (GRU)
-    parser.add_argument('--emb_dim', type=int, default=256,
+    parser.add_argument('--emb_dim', type=int, default=192,
                         help='Embedding dimension')
-    parser.add_argument('--hid_dim', type=int, default=512,
+    parser.add_argument('--hid_dim', type=int, default=384,
                         help='GRU hidden dimension')
     parser.add_argument('--n_layers', type=int, default=2,
                         help='Number of GRU layers')
     parser.add_argument('--dropout', type=float, default=0.3,
                         help='Dropout rate')
-    
+    parser.add_argument('--weight_tying', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Tie embedding and output weights (reduces model size)')
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help='Label smoothing factor (0.0 to disable)')
+
     # Training
     parser.add_argument('--epochs', type=int, default=15,
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=128,
                         help='Batch size')
-    parser.add_argument('--grad_accum_steps', type=int, default=1,
+    parser.add_argument('--grad_accum_steps', type=int, default=4,
                         help='Gradient accumulation steps (increase for effective larger batch)')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Learning rate')
@@ -1088,7 +1265,7 @@ def parse_args():
                         help='Early stopping patience')
     parser.add_argument('--val_split', type=float, default=0.1,
                         help='Validation split ratio')
-    
+
     # Other
     parser.add_argument('--output_dir', type=str, default='bangla_gru_sp',
                         help='Output directory')

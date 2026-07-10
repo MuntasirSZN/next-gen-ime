@@ -35,8 +35,9 @@ def load_predictors(model_dir: str):
         hid_dim=config["hid_dim"],
         n_layers=config["n_layers"],
         dropout=config.get("dropout", 0.3),
+        weight_tying=config.get("weight_tying", False),
     ).to(device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.eval()
 
     context_len = config["context_len"]

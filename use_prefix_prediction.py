@@ -46,10 +46,11 @@ def load_model(model_dir: str):
         emb_dim=config['emb_dim'],
         hid_dim=config['hid_dim'],
         n_layers=config['n_layers'],
-        dropout=config.get('dropout', 0.3)
+        dropout=config.get('dropout', 0.3),
+        weight_tying=config.get('weight_tying', False),
     ).to(device)
     
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(checkpoint['model'], strict=False)
     model.eval()
     print(f"✓ Loaded model ({sum(p.numel() for p in model.parameters()):,} parameters)")
     

@@ -7,6 +7,7 @@ Usage:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -14,12 +15,14 @@ class NextWordGRU(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        emb_dim: int = 256,
-        hid_dim: int = 512,
+        emb_dim: int = 192,
+        hid_dim: int = 384,
         n_layers: int = 2,
         dropout: float = 0.3,
+        weight_tying: bool = True,
     ):
         super().__init__()
+        self.weight_tying = weight_tying
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -30,13 +33,28 @@ class NextWordGRU(nn.Module):
             bidirectional=False,
         )
         self.drop = nn.Dropout(dropout)
-        self.fc = nn.Linear(hid_dim, vocab_size)
+        self.layer_norm = nn.LayerNorm(hid_dim)
+
+        if weight_tying:
+            if hid_dim != emb_dim:
+                self.proj = nn.Linear(hid_dim, emb_dim, bias=False)
+            else:
+                self.proj = nn.Identity()
+            self.output_bias = nn.Parameter(torch.zeros(vocab_size))
+        else:
+            self.proj = None
+            self.fc = nn.Linear(hid_dim, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         embedded = self.drop(self.emb(x))
         output, _ = self.gru(embedded)
-        last_hidden = self.drop(output[:, -1, :])
-        return self.fc(last_hidden)
+        last_hidden = self.drop(self.layer_norm(output[:, -1, :]))
+
+        if self.weight_tying:
+            projected = self.proj(last_hidden)
+            return F.linear(projected, self.emb.weight, self.output_bias)
+        else:
+            return self.fc(last_hidden)
 
 
 class NextWordGRUInference(nn.Module):
@@ -46,13 +64,24 @@ class NextWordGRUInference(nn.Module):
         super().__init__()
         self.emb = model.emb
         self.gru = model.gru
-        self.fc = model.fc
+        self.layer_norm = model.layer_norm
+        self.weight_tying = model.weight_tying
+        if model.weight_tying:
+            self.proj = model.proj
+            self.output_bias = model.output_bias
+        else:
+            self.fc = model.fc
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         embedded = self.emb(x)
         output, _ = self.gru(embedded)
-        last_hidden = output[:, -1, :]
-        return self.fc(last_hidden)
+        last_hidden = self.layer_norm(output[:, -1, :])
+
+        if self.weight_tying:
+            projected = self.proj(last_hidden)
+            return F.linear(projected, self.emb.weight, self.output_bias)
+        else:
+            return self.fc(last_hidden)
 
 
 def main():
@@ -71,8 +100,9 @@ def main():
         hid_dim=config["hid_dim"],
         n_layers=config["n_layers"],
         dropout=config.get("dropout", 0.3),
+        weight_tying=config.get("weight_tying", False),
     )
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     model.eval()
 
     # Wrap in inference-only model (no dropout nodes in the ONNX graph)
