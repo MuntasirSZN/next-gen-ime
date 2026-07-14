@@ -12,7 +12,7 @@ low-latency IME inference on Apple Silicon.
 | Tokenizer | SentencePiece BPE |
 | Vocab | 8,000 tokens |
 | Context | 16 subword tokens |
-| Params | ~3.2M (~12 MB) |
+| Params | ~6.2M (~24 MB) |
 | Inference | PyTorch, ONNX, Rust |
 
 ## Quick Start
@@ -77,6 +77,7 @@ logits to `-inf` before softmax).
 
 - **wikimedia/wikipedia** (Bengali, 20231101) — up to 50k articles (streaming)
 - **shawon95/Bengali-Fake-Review-Dataset** — ~9k reviews
+- **zabir-nabil/bangla_newspaper_dataset** — up to 50k newspaper articles (streaming)
 
 Texts are split into sentences at Bengali danda `।`, double danda `॥`, and
 standard punctuation before tokenization, preventing cross-topic context leaking
@@ -84,14 +85,14 @@ and ensuring full data utilization by the SentencePiece trainer.
 
 ### Model
 
-- **Embedding**: 192-dim with weight tying (shared with output projection)
-- **GRU**: 384 hidden, 2 layers, dropout 0.3
+- **Embedding**: 384-dim with weight tying (shared with output projection)
+- **GRU**: 512 hidden, 2 layers, dropout 0.3
 - **LayerNorm** before output projection
 - **Output**: projection from hidden to embedding space, then `F.linear` with
   tied embedding weights
 
-Weight tying cuts the output layer parameters entirely, reducing model size by
-~5x compared to a standard untied architecture.
+Weight tying cuts the output layer parameters entirely, reducing model size
+compared to a standard untied architecture.
 
 ### Training Config
 
@@ -99,12 +100,11 @@ Weight tying cuts the output layer parameters entirely, reducing model size by
 - **Schedule**: Linear warmup (10% of epochs) + cosine annealing to 1e-6
 - **Loss**: CrossEntropyLoss with label smoothing (0.1)
 - **Batch**: 128 x 4 gradient accumulation = effective 512
-- **Mixed precision**: float16 autocast on MPS (no GradScaler needed)
+- **Precision**: float32 (float16 autocast causes GRU hidden state overflow)
 - **Early stopping**: patience 4 epochs
 
 ### M4/Apple Silicon Optimizations
 
-- MPS float16 autocast in train and eval loops
 - `PYTORCH_MPS_FAST_MATH=1` for faster Metal kernels
 - `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0` for memory management
 - `num_workers=0`, `pin_memory=False` (MPS best practice)
@@ -140,8 +140,8 @@ inference/               # Rust ONNX inference
 --max_samples N     Max samples per dataset (default: 50000)
 --context_len N     Context length in tokens (default: 16)
 --vocab_size N      SentencePiece vocab size (default: 8000)
---emb_dim N         Embedding dimension (default: 192)
---hid_dim N         GRU hidden dimension (default: 384)
+--emb_dim N         Embedding dimension (default: 384)
+--hid_dim N         GRU hidden dimension (default: 512)
 --weight_tying      Tie embedding/output weights (default: on)
 --no-weight_tying   Disable weight tying
 --label_smoothing F Label smoothing factor (default: 0.1)

@@ -15,8 +15,8 @@ class NextWordGRU(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        emb_dim: int = 192,
-        hid_dim: int = 384,
+        emb_dim: int = 384,
+        hid_dim: int = 512,
         n_layers: int = 2,
         dropout: float = 0.3,
         weight_tying: bool = True,

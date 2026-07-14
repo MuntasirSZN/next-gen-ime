@@ -282,8 +282,8 @@ class NextWordGRU(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        emb_dim: int = 192,
-        hid_dim: int = 384,
+        emb_dim: int = 384,
+        hid_dim: int = 512,
         n_layers: int = 2,
         dropout: float = 0.3,
         weight_tying: bool = True,
@@ -383,28 +383,7 @@ def load_bangla_data(max_samples: int = 50000) -> List[str]:
     all_texts = []
     bangla_pattern = re.compile(r'[\u0980-\u09FF]+')
     
-    # Dataset 1: BanglaNMT
-    print("\n" + "=" * 60)
-    print("Loading: csebuetnlp/BanglaNMT")
-    print("=" * 60)
-    try:
-        ds = load_dataset('csebuetnlp/BanglaNMT', split='train')
-        print(f"  ✓ Loaded {len(ds):,} samples")
-        
-        if 'bn' in ds.column_names:
-            texts = [str(t) for t in ds['bn'][:max_samples] if t]
-            all_texts.extend(texts)
-            print(f"  ✓ Added {len(texts):,} Bengali texts")
-            
-            if texts:
-                sample = texts[0][:80]
-                words = bangla_pattern.findall(sample)
-                print(f"  Sample: '{sample}...'")
-                print(f"  Words found: {len(words)}")
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-    
-    # Dataset 2: Bengali Wikipedia
+    # Dataset 1: Bengali Wikipedia
     print("\n" + "=" * 60)
     print("Loading: wikimedia/wikipedia (Bengali)")
     print("=" * 60)
@@ -434,7 +413,7 @@ def load_bangla_data(max_samples: int = 50000) -> List[str]:
         ds = load_dataset('shawon95/Bengali-Fake-Review-Dataset', split='train')
         print(f"  ✓ Loaded {len(ds):,} samples")
         print(f"  Columns: {ds.column_names}")
-        
+
         for col in ds.column_names:
             sample = ds[0][col]
             if isinstance(sample, str) and bangla_pattern.findall(sample):
@@ -444,7 +423,28 @@ def load_bangla_data(max_samples: int = 50000) -> List[str]:
                 break
     except Exception as e:
         print(f"  ✗ Error: {e}")
-    
+
+    # Dataset 4: Bengali newspaper articles
+    print("\n" + "=" * 60)
+    print("Loading: zabir-nabil/bangla_newspaper_dataset")
+    print("=" * 60)
+    try:
+        ds = load_dataset('zabir-nabil/bangla_newspaper_dataset', split='train', streaming=True)
+        print("  ✓ Loaded (streaming mode)")
+        texts = []
+        for i, item in enumerate(ds):
+            if i >= max_samples:
+                break
+            content = item.get('content') or item.get('text') or ''
+            if content and bangla_pattern.findall(str(content)):
+                texts.append(str(content))
+            if (i + 1) % 10000 == 0:
+                print(f"     Loaded {i + 1:,} articles...")
+        all_texts.extend(texts)
+        print(f"  ✓ Added {len(texts):,} newspaper articles")
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+
     print("\n" + "=" * 60)
     print(f"TOTAL TEXTS LOADED: {len(all_texts):,}")
     print("=" * 60)
@@ -494,15 +494,11 @@ def train_epoch(
     
     running_loss = 0.0
     
-    use_amp = device.type == "mps"
-
     for batch_idx, (ctx, tgt) in enumerate(pbar):
         ctx, tgt = ctx.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
 
-        # Forward pass with optional float16 autocast on MPS
-        with torch.amp.autocast("mps", dtype=torch.float16, enabled=use_amp):
-            logits = model(ctx)
-            loss = criterion(logits, tgt)
+        logits = model(ctx)
+        loss = criterion(logits, tgt)
 
         # Scale loss for gradient accumulation
         loss = loss / grad_accum_steps
@@ -561,14 +557,11 @@ def evaluate(
     else:
         pbar = loader
     
-    use_amp = device.type == "mps"
-
     for ctx, tgt in pbar:
         ctx, tgt = ctx.to(device, non_blocking=True), tgt.to(device, non_blocking=True)
 
-        with torch.amp.autocast("mps", dtype=torch.float16, enabled=use_amp):
-            out = model(ctx)
-            total_loss += criterion(out, tgt).item()
+        out = model(ctx)
+        total_loss += criterion(out, tgt).item()
 
         # Top-1 accuracy
         correct += (out.argmax(-1) == tgt).sum().item()
@@ -944,7 +937,6 @@ def main(args):
         weight_tying=args.weight_tying,
     )
 
-    # Move to device and ensure float32 (MPS has limited float16 support)
     model = model.to(device=device, dtype=torch.float32)
     
     n_params = sum(p.numel() for p in model.parameters())
@@ -1238,9 +1230,9 @@ def parse_args():
                         help='SentencePiece model type')
 
     # Model (GRU)
-    parser.add_argument('--emb_dim', type=int, default=192,
+    parser.add_argument('--emb_dim', type=int, default=384,
                         help='Embedding dimension')
-    parser.add_argument('--hid_dim', type=int, default=384,
+    parser.add_argument('--hid_dim', type=int, default=512,
                         help='GRU hidden dimension')
     parser.add_argument('--n_layers', type=int, default=2,
                         help='Number of GRU layers')
