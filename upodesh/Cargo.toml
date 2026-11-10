@@ -1,0 +1,43 @@
+[package]
+name = "upodesh"
+description = "A Rust library for generating Bengali word suggestions based on a given input string."
+version = "0.4.1"
+license = "MIT"
+repository = "https://github.com/OpenBangla/upodesh"
+keywords = ["unicode", "bengali", "suggestion"]
+exclude = ["generate", "generate/*", "bencher", "bencher/*"]
+edition = "2024"
+rust-version = "1.91.0"
+
+[dependencies]
+dhoni = { git = "https://github.com/MuntasirSZN/dhoni.git", rev = "f64197c" }
+fst = "0.4"
+serde_json = "1.0"
+simd-normalizer = "0.1"
+unicode-segmentation = "1.13"
+
+[build-dependencies]
+fst = "0.4"
+serde_json = "1.0"
+simd-normalizer = "0.1"
+unicode-segmentation = "1.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+criterion = "0.8"
+serde_json = "1.0"
+
+[[bench]]
+name = "suggestions"
+harness = false
+
+[[bench]]
+name = "varied"
+harness = false

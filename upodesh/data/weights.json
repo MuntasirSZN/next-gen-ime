@@ -1,0 +1,20 @@
+{
+  "generated_by": "generate/train_weights.py",
+  "generated_from": {
+    "corpus": "bn.txt",
+    "corpus_sha256": "a5b0ec3df504ebcadf551249c6dc53c9ab17112739aedfa861b52e6b7b2f2d6d",
+    "pairs": "generate/out/pairs.tsv",
+    "pairs_sha256": "6675e901c30d68d959232389c64bcd522aa1bf30d481181c74ffa463feeaf70c",
+    "pairs_total": 40000,
+    "seed": 42,
+    "license": "CC-0 (IndicCorp V2 base + synthetic operators)"
+  },
+  "class_weights": {
+    "delete": 0.205725,
+    "duplicate": 0.209175,
+    "mispress": 0.153075,
+    "mispress-insert": 0.15065,
+    "phonetic": 0.07665,
+    "transpose": 0.204725
+  }
+}

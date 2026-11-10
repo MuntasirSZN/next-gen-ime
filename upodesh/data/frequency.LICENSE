@@ -1,0 +1,48 @@
+# Frequency data
+
+`data/frequency.json` is a derived word-count table used as the ranking prior for
+`upodesh`.
+
+## Source
+
+Counts are derived from the **IndicCorp V2** Bengali corpus
+(`bn.txt`, ~15.9 GB, one sentence per line), part of the AI4Bharat
+`ai4bharat/IndicCorpV2` dataset on Hugging Face. Only tokens matching
+dictionary words are kept (99,422 / 159,384 = 62.4%, from 922M tokens).
+
+Corpus provenance:
+
+- Dataset: `ai4bharat/IndicCorpV2` (Hugging Face)
+- Benchmark paper: Doddapaneni et al. (2023), *Towards Leaving No Indic
+  Language Behind: Building Monolingual Corpora, Benchmark and Models for
+  Indic Languages*, ACL 2023 (arXiv:2112.02972), doi:10.18653/v1/2023.acl-long.693
+- Corpus file sha256:
+  `a5b0ec3df504ebcadf551249c6dc53c9ab17112739aedfa861b52e6b7b2f2d6d`
+
+## Licence
+
+IndicCorp V2 is made available under the **Creative Commons CC-0**
+assignment of creators' rights (public domain dedication):
+
+<https://creativecommons.org/publicdomain/zero/1.0/>
+
+The dataset card states that datasets created as part of this work are
+released under CC-0 and models/code under MIT. The derived counts here
+are CC-0-clean; this attribution exists for citation and provenance.
+
+## Attribution
+
+> Doddapaneni, S., Aralikatte, R., Ramesh, G., Goyal, S., Khapra, M. M.,
+> Kunchukuttan, A., et al. (2023): *Towards Leaving No Indic Language
+> Behind: Building Monolingual Corpora, Benchmark and Models for Indic
+> Languages.* Proceedings of the 61st Annual Meeting of the Association
+> for Computational Linguistics (ACL 2023).
+
+Data: AI4Bharat IndicCorp V2, distributed by the IndicNLP project.
+
+## Regenerating
+
+```sh
+cargo run --release --manifest-path generate/Cargo.toml --bin corpus-count -- \
+    --corpus /tmp/opencode/bn.txt --out data/frequency.json
+```

@@ -150,3 +150,9 @@ inference/               # Rust ONNX inference
 --lr F              Learning rate (default: 0.001)
 --patience N        Early stopping patience (default: 4)
 ```
+
+## Experiments
+
+- `upodesh/` — typo-tolerant Bangla suggestion crate (grapheme trie +
+  weighted edit distance + frequency + bigram/trigram), pushed here to
+  iterate alongside the GRU next-word model. See `upodesh/EXPERIMENT.md`.
