@@ -10,13 +10,14 @@ edition = "2024"
 rust-version = "1.91.0"
 
 [dependencies]
-dhoni = { git = "https://github.com/MuntasirSZN/dhoni.git", rev = "f64197c" }
+dhoni = { git = "https://github.com/MuntasirSZN/dhoni.git", rev = "34a2116" }
 fst = "0.4"
 serde_json = "1.0"
 simd-normalizer = "0.1"
 unicode-segmentation = "1.13"
 
 [build-dependencies]
+dhoni = { git = "https://github.com/MuntasirSZN/dhoni.git", rev = "34a2116" }
 fst = "0.4"
 serde_json = "1.0"
 simd-normalizer = "0.1"
