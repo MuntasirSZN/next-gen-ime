@@ -4,16 +4,16 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use fst::{Map, Streamer};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::distance::weighted_osa_distance;
-use super::normalize::normalize_cow;
-use super::trie::Trie;
-use super::{automaton, roman};
 use super::config::{CorrectionConfig, InputMode};
 use super::costs::EditCosts;
+use super::distance::weighted_osa_distance;
 use super::language_model::BigramLanguageModel;
 use super::morphology::Morphology;
+use super::normalize::normalize_cow;
+use super::trie::Trie;
 use super::trigram::TrigramLanguageModel;
 use super::types::{BuildError, Correction, IndexStats, Suggestion, SuggestionInput, WordEntry};
+use super::{automaton, roman};
 
 /// FNV-1a over a byte slice (blob integrity offsets must mirror build.rs).
 fn fnv1a(data: &[u8]) -> u64 {
@@ -207,7 +207,6 @@ pub struct Corrector {
     trigram_language_model: Option<TrigramLanguageModel>,
 }
 
-
 /// Build both Roman tries from word list using `dhoni` (git dependency).
 /// Khipro forms use Khipro mode, so they carry `/` candrabindu markers,
 /// `t/` for ৎ, and trailing-`/` variants for virama words; Avro forms use
@@ -396,9 +395,7 @@ impl Corrector {
                 .get(*cursor..*cursor + 4)
                 .ok_or(BuildError::InvalidIndex(reason))?;
             *cursor += 4;
-            Ok::<u32, BuildError>(u32::from_le_bytes(
-                [chunk[0], chunk[1], chunk[2], chunk[3]],
-            ))
+            Ok::<u32, BuildError>(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         };
 
         let grapheme_count = read_u32(&mut cursor, "truncated grapheme count")? as usize;
@@ -650,6 +647,9 @@ impl Corrector {
                     let worst_freq = *worst_freq;
                     if self.trie.mx[frame.node as usize] < worst_freq {
                         stack.pop();
+                        if path.len() > n - 1 {
+                            path.pop();
+                        }
                         continue;
                     }
                 }
@@ -692,19 +692,12 @@ impl Corrector {
             }
             let (start, cnt) = self.trie.children(frame.node);
             if (frame.next_child as usize) >= cnt {
-                // Stopping a node also stops its path contribution.
-                let was_root_prefix = path.len() == n - 1 && stack.len() == 1;
+                // Leaving a node must also drop the path entry it pushed.
+                // The root frame's path is the mandatory prefix (n-1
+                // graphemes) and must survive.
                 stack.pop();
-                if !was_root_prefix && !path.is_empty() {
-                    // Pop only when leaving a non-root frame; the root
-                    // frame's path is the mandatory prefix.
-                    if !stack.is_empty() {
-                        // The path entry for this node is the last one.
-                        let depth = path.len();
-                        if depth > n - 1 {
-                            path.pop();
-                        }
-                    }
+                if path.len() > n - 1 {
+                    path.pop();
                 }
                 continue;
             }
@@ -787,7 +780,13 @@ impl Corrector {
                 .collect();
         };
         if limit == 0 || self.config.roman_weight <= 0.0 {
-            return self.suggest_input(&SuggestionInput { roman: None, ..*query }, limit);
+            return self.suggest_input(
+                &SuggestionInput {
+                    roman: None,
+                    ..*query
+                },
+                limit,
+            );
         }
 
         let mut candidates: HashMap<String, MergedCandidate> = bangla_hits
@@ -804,9 +803,10 @@ impl Corrector {
         };
         let hits = roman::roman_search(trie, roman, self.config.max_roman_cost, &costs);
         let normalized = normalize_cow(query.bangla.trim());
-        let query_graphemes: Vec<String> = UnicodeSegmentation::graphemes(normalized.as_ref(), true)
-            .map(str::to_owned)
-            .collect();
+        let query_graphemes: Vec<String> =
+            UnicodeSegmentation::graphemes(normalized.as_ref(), true)
+                .map(str::to_owned)
+                .collect();
         for (word, roman_cost) in hits {
             let entry = candidates.entry(word).or_insert_with_key(|word| {
                 // Found only via the Roman path: score its Bangla side exactly.
@@ -829,25 +829,31 @@ impl Corrector {
         let missing_roman_cost = self.config.max_roman_cost.saturating_add(1);
         let mut out: Vec<Suggestion> = candidates
             .into_iter()
-            .map(|(word, (edit_cost, roman_cost, frequency, context_probability))| {
-                let roman_score = self.config.roman_weight
-                    * (roman_cost.unwrap_or(missing_roman_cost) as f64 / 100.0);
-                Suggestion {
-                    score: self.score(edit_cost, frequency, context_probability) + roman_score,
-                    word,
-                    edit_cost,
-                    roman_cost,
-                    frequency,
-                    context_probability,
-                }
-            })
+            .map(
+                |(word, (edit_cost, roman_cost, frequency, context_probability))| {
+                    let roman_score = self.config.roman_weight
+                        * (roman_cost.unwrap_or(missing_roman_cost) as f64 / 100.0);
+                    Suggestion {
+                        score: self.score(edit_cost, frequency, context_probability) + roman_score,
+                        word,
+                        edit_cost,
+                        roman_cost,
+                        frequency,
+                        context_probability,
+                    }
+                },
+            )
             .collect();
+        // The typed Roman string is the strongest signal: rank by Roman
+        // evidence first. When two words share the same Roman cost (identical
+        // spelling), the lexical prior decides — a common word beats a rare
+        // homophone — and the combined score breaks any remaining tie.
         out.sort_by(|a, b| {
-            b.edit_cost
-                .eq(&0)
-                .cmp(&a.edit_cost.eq(&0))
-                .then(a.score.total_cmp(&b.score))
+            let left = a.roman_cost.unwrap_or(missing_roman_cost);
+            let right = b.roman_cost.unwrap_or(missing_roman_cost);
+            left.cmp(&right)
                 .then(b.frequency.cmp(&a.frequency))
+                .then(a.score.total_cmp(&b.score))
                 .then(a.word.cmp(&b.word))
         });
         out.truncate(limit);
@@ -1332,8 +1338,8 @@ mod tests {
     use super::super::morphology::{Morphology, SuffixRule};
     use super::super::types::WordEntry;
     use super::*;
-    use std::collections::BTreeSet;
     use simd_normalizer::UnicodeNormalization;
+    use std::collections::BTreeSet;
     use unicode_segmentation::UnicodeSegmentation;
 
     fn test_corrector() -> Corrector {

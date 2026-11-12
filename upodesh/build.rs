@@ -1,11 +1,11 @@
-//! Build-time construction of the embedded correction index (v2).
+//! Build-time construction of the embedded correction index (v3).
 //!
 //! The runtime `Corrector::from_bytes` maps one blob containing:
 //! Bangla grapheme table + Bangla FST + two Roman tries (Avro, Khipro).
-//! Roman tries are built from the pattern tables derived from okkhor/riti
-//! rules (see `data/ATTRIBUTION.md`); see `src/typo/roman_gen.rs`.
+//! Roman spellings come from `dhoni`, the same converter `from_entries` uses
+//! at runtime, so an embedded index and an in-memory index stay in sync.
 
-include!("src/typo/roman_gen.rs");
+include!("src/typo/derive.rs");
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,14 +42,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", frequencies.display());
     println!(
         "cargo:rerun-if-changed={}",
-        manifest.join("data/avro-patterns.json").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("data/khipro-patterns.json").display()
+        manifest.join("data/lemma.json").display()
     );
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/typo/roman_gen.rs");
+    println!("cargo:rerun-if-changed=src/typo/derive.rs");
 
     let text = fs::read_to_string(&dictionary).expect("read upstream dictionary.json");
     let root: serde_json::Value = serde_json::from_str(&text).expect("dictionary.json is JSON");
@@ -77,6 +73,19 @@ fn main() {
         }
     }
     assert!(!entries.is_empty(), "dictionary contains no words");
+
+    // Derive the genitive `-র` for noun lemmas ending in `ী`, e.g.
+    // পৃথিবী → পৃথিবীর, which upstream dictionaries/frequency tables omit even
+    // though typists expect it. Shared with the in-memory builder and the
+    // regression test via `src/typo/derive.rs`.
+    let lemma_table: BTreeMap<String, String> =
+        fs::read_to_string(manifest.join("data/lemma.json"))
+            .ok()
+            .map(|text| serde_json::from_str(&text).expect("lemma table is JSON"))
+            .unwrap_or_default();
+    for (word, frequency) in genitive_forms(&entries, &lemma_table, &frequency_table) {
+        entries.insert(word, frequency);
+    }
 
     let graphemes: BTreeSet<String> = entries
         .keys()
@@ -117,10 +126,7 @@ fn main() {
     let map_bytes = map.as_fst().as_bytes().to_vec();
 
     // ---- Roman tries for both modes -------------------------------
-    let avro_bytes = fs::read(manifest.join("data/avro-patterns.json")).unwrap_or_default();
-    let khipro_bytes = fs::read(manifest.join("data/khipro-patterns.json")).unwrap_or_default();
-    let avro_set = load_patterns(&avro_bytes);
-    let khipro_set = load_patterns(&khipro_bytes);
+    let roman_modes = [dhoni::Mode::Avro, dhoni::Mode::Khipro];
 
     let mut blob = Vec::new();
     blob.extend_from_slice(MAGIC_V3);
@@ -140,11 +146,11 @@ fn main() {
         word_off.push(words_blob.len() as u32);
         words_blob.extend_from_slice(w.as_bytes());
     }
-    for set in [&avro_set, &khipro_set] {
+    for mode in roman_modes {
         // collect (form, word id)
         let mut forms: Vec<(Vec<u8>, u32)> = Vec::new();
         for (wi, w) in words.iter().enumerate() {
-            for f in set.forms(w) {
+            for f in dhoni::convert_to_phonetic_variants(w, mode) {
                 if f.is_empty() {
                     continue;
                 }

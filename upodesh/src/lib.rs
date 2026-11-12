@@ -87,6 +87,19 @@ mod tests {
                 }
             }
         }
+        let lemma: BTreeMap<String, String> =
+            serde_json::from_str(include_str!("../data/lemma.json"))
+                .expect("lemma table is valid JSON");
+        let mut frequencies_by_word = BTreeMap::<String, u64>::new();
+        for entry in &entries {
+            let slot = frequencies_by_word.entry(entry.word.clone()).or_default();
+            *slot = slot.saturating_add(entry.frequency.max(1));
+        }
+        for (word, frequency) in
+            crate::typo::derive::genitive_forms(&frequencies_by_word, &lemma, &frequencies)
+        {
+            entries.push(WordEntry::new(word, frequency));
+        }
         entries
     }
 
@@ -140,7 +153,46 @@ mod tests {
         ] {
             let query = SuggestionInput::with_roman(roman, bangla, mode);
             let top = corrector.suggest_input(&query, 5);
-            assert_eq!(top.first().map(|s| s.word.as_str()), Some(expected), "{roman}: {top:?}");
+            assert_eq!(
+                top.first().map(|s| s.word.as_str()),
+                Some(expected),
+                "{roman}: {top:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_prefix_only_returns_extensions_of_the_prefix() {
+        let corrector = corrector();
+        for prefix in ["আম", "বাং", "কিং", "প্রি", "পৃ"] {
+            let completions = corrector.complete_prefix(prefix, 8);
+            assert!(!completions.is_empty(), "{prefix} produced no completions");
+            for word in &completions {
+                assert!(
+                    word.starts_with(prefix),
+                    "{word} does not start with {prefix}"
+                );
+                assert!(corrector.contains(word), "{word} is not an indexed word");
+            }
+        }
+    }
+
+    #[test]
+    fn roman_queries_rank_the_intended_word_first() {
+        // Regressions from OpenBangla/next-gen-ime#4.
+        let corrector = corrector();
+        for (roman, bangla, expected) in [
+            ("kingkortobbobimur", "কিংকর্তব্ববিমুর", "কিংকর্তব্যবিমূঢ়"),
+            ("prithibir", "প্রিথিবির", "পৃথিবীর"),
+            ("chino", "ছিন", "চিনো"),
+        ] {
+            let query = SuggestionInput::with_roman(roman, bangla, InputMode::Avro);
+            let top = corrector.suggest_input(&query, 5);
+            assert_eq!(
+                top.first().map(|s| s.word.as_str()),
+                Some(expected),
+                "{roman}: {top:?}"
+            );
         }
     }
 

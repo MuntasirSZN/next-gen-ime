@@ -738,7 +738,7 @@ checksum = "21d8ad60dd5b13a4ee6bd8fa2d5d88965c597c67bce32b5fc49c94f55cb50810"
 [[package]]
 name = "dhoni"
 version = "0.1.0"
-source = "git+https://github.com/MuntasirSZN/dhoni.git?rev=f64197c#f64197cbd69397d015d2091a59edfed3644f826f"
+source = "git+https://github.com/MuntasirSZN/dhoni.git?rev=34a2116#34a21165d3b9e9a983cb4c4099eb6d3ba8338185"
 
 [[package]]
 name = "digest"
