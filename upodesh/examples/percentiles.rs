@@ -12,6 +12,10 @@
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use peak_alloc::PeakAlloc;
+
+#[global_allocator]
+static PEAK_ALLOC: PeakAlloc = PeakAlloc;
 
 use upodesh::corrector;
 
@@ -68,4 +72,9 @@ fn main() {
         println!("{name}: p50={p50:?} p95={p95:?} p99={p99:?}");
     }
     println!("reference bar: GBoard tracks <5 ms/keystroke; we're µs-range.");
+
+    let current_mem = PEAK_ALLOC.current_usage_as_mb();
+	println!("\nThis program currently uses {} MB of RAM.", current_mem);
+	let peak_mem = PEAK_ALLOC.peak_usage_as_mb();
+	println!("The max amount that was used {} MB of RAM.", peak_mem);
 }
