@@ -179,7 +179,6 @@ impl EditCosts {
             .map(|(_, _, cost)| *cost)
     }
 
-    #[cfg(test)]
     pub(crate) fn substitution_cost(&self, left: &str, right: &str) -> u16 {
         if left == right {
             return 0;

@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use fst::{Map, Streamer};
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(test)]
 use super::distance::weighted_osa_distance;
 use super::normalize::normalize_cow;
 use super::trie::Trie;
@@ -244,9 +243,9 @@ fn build_roman_tries(words: Vec<String>) -> [roman::RomanTrie; 2] {
     [a, k]
 }
 
-/// One merged candidate's combined scores: (score, edit cost, roman cost,
+/// One merged `suggest_input` candidate: (edit cost, best roman cost,
 /// frequency, context probability).
-type ScoreEntry = (f64, u16, Option<u16>, u64, Option<f64>);
+type MergedCandidate = (u16, Option<u16>, u64, Option<f64>);
 
 impl Corrector {
     /// Counts and limits for the embedded index (words, graphemes, lengths).
@@ -756,64 +755,90 @@ impl Corrector {
     }
 
     /// Unified dual-input suggestion: Bangla typo trie + Roman index.
-    /// `roman: None` behaves like the pure Bangla API. Roman and Bangla
-    /// signals are combined with calibrated weights (correlated evidence,
-    /// not independent probabilities).
+    ///
+    /// `roman: None` (or `InputMode::Bangla`) behaves like the pure Bangla
+    /// API. Otherwise each candidate is scored as
+    /// `edit/100 + roman_weight * roman/100 - frequency - context`, lower is
+    /// better: the two channels are correlated evidence, so their costs add
+    /// with a calibrated weight rather than multiplying as independent
+    /// probabilities. Words found only through the Roman index get their
+    /// exact Bangla edit cost; Bangla candidates the Roman search did not
+    /// reach are charged `max_roman_cost + 1`, a lower bound on their true
+    /// Roman cost, so a missing Roman match never beats a found one.
     pub fn suggest_input(&self, query: &SuggestionInput<'_>, limit: usize) -> Vec<Suggestion> {
         let bangla_hits = self.correct_with_context(query.bangla, query.context, limit.max(20));
-        let mut scores: std::collections::HashMap<String, ScoreEntry> =
-            std::collections::HashMap::new();
-        for c in &bangla_hits {
-            scores.insert(
-                c.word.clone(),
-                (
-                    c.score,
-                    c.edit_cost,
-                    None,
-                    c.frequency,
-                    c.context_probability,
-                ),
-            );
+        let roman_trie = match query.mode {
+            InputMode::Avro => Some(&self.roman[0]),
+            InputMode::Khipro => Some(&self.roman[1]),
+            InputMode::Bangla => None,
+        };
+        let (Some(roman), Some(trie)) = (query.roman, roman_trie) else {
+            return bangla_hits
+                .into_iter()
+                .take(limit)
+                .map(|c| Suggestion {
+                    word: c.word,
+                    score: c.score,
+                    edit_cost: c.edit_cost,
+                    roman_cost: None,
+                    frequency: c.frequency,
+                    context_probability: c.context_probability,
+                })
+                .collect();
+        };
+        if limit == 0 || self.config.roman_weight <= 0.0 {
+            return self.suggest_input(&SuggestionInput { roman: None, ..*query }, limit);
         }
-        if let Some(roman) = query.roman
-            && self.config.roman_weight > 0.0
-        {
-            let idx = match query.mode {
-                InputMode::Avro => 0,
-                InputMode::Khipro => 1,
-                InputMode::Bangla => 0,
-            };
-            let costs = roman::RomanCosts {
-                insertion: 100,
-                deletion: 100,
-                transposition: 65,
-            };
-            let hits =
-                roman::roman_search(&self.roman[idx], roman, self.config.max_roman_cost, &costs);
-            for (word, rcost) in hits {
-                let entry = scores.entry(word.clone()).or_insert_with(|| {
-                    // Word found only via Roman path: score it at retrieval.
-                    let frequency = Self::frequency_of(&word, &self.trie, &self.graphemes);
-                    (u16::MAX as f64 / 100.0, u16::MAX, None, frequency, None)
-                });
-                entry.1 = entry.1.min(self.edit_cost_of(&word, query.bangla));
-                entry.2 = Some(rcost);
-            }
-        }
-        let mut out: Vec<Suggestion> = scores
+
+        let mut candidates: HashMap<String, MergedCandidate> = bangla_hits
             .into_iter()
-            .map(|(word, (bscore, ecost, rcost, freq, cprob))| {
-                let mut score = bscore;
-                if let Some(rc) = rcost {
-                    score -= self.config.roman_weight * (rc as f64 / 100.0);
-                }
+            .map(|c| {
+                let merged = (c.edit_cost, None, c.frequency, c.context_probability);
+                (c.word, merged)
+            })
+            .collect();
+        let costs = roman::RomanCosts {
+            insertion: 100,
+            deletion: 100,
+            transposition: 65,
+        };
+        let hits = roman::roman_search(trie, roman, self.config.max_roman_cost, &costs);
+        let normalized = normalize_cow(query.bangla.trim());
+        let query_graphemes: Vec<String> = UnicodeSegmentation::graphemes(normalized.as_ref(), true)
+            .map(str::to_owned)
+            .collect();
+        for (word, roman_cost) in hits {
+            let entry = candidates.entry(word).or_insert_with_key(|word| {
+                // Found only via the Roman path: score its Bangla side exactly.
+                let graphemes: Vec<String> = UnicodeSegmentation::graphemes(word.as_str(), true)
+                    .map(str::to_owned)
+                    .collect();
+                let edit_cost =
+                    weighted_osa_distance(&query_graphemes, &graphemes, &self.edit_costs);
+                (
+                    edit_cost,
+                    None,
+                    self.frequency_of(word),
+                    self.context_probability(query.context, word),
+                )
+            });
+            // A word can have several Roman forms; keep its best match.
+            entry.1 = Some(entry.1.map_or(roman_cost, |best| best.min(roman_cost)));
+        }
+
+        let missing_roman_cost = self.config.max_roman_cost.saturating_add(1);
+        let mut out: Vec<Suggestion> = candidates
+            .into_iter()
+            .map(|(word, (edit_cost, roman_cost, frequency, context_probability))| {
+                let roman_score = self.config.roman_weight
+                    * (roman_cost.unwrap_or(missing_roman_cost) as f64 / 100.0);
                 Suggestion {
+                    score: self.score(edit_cost, frequency, context_probability) + roman_score,
                     word,
-                    score,
-                    edit_cost: ecost,
-                    roman_cost: rcost,
-                    frequency: freq,
-                    context_probability: cprob,
+                    edit_cost,
+                    roman_cost,
+                    frequency,
+                    context_probability,
                 }
             })
             .collect();
@@ -829,33 +854,40 @@ impl Corrector {
         out
     }
 
-    fn edit_cost_of(&self, word: &str, _bangla: &str) -> u16 {
-        // Exact OSA cost of the candidate against the query is computed by
-        // the caller through the trie terminals; this hook only restores a
-        // sane default for words the Bangla path missed. Kept cheap by
-        // returning the *post-retrieval* estimate.
-        let _ = word;
-        0
+    /// Dictionary frequency of a normalized word, or 1 when it is absent.
+    fn frequency_of(&self, word: &str) -> u64 {
+        let mut node = 0u32;
+        for grapheme in UnicodeSegmentation::graphemes(word, true) {
+            let next = self
+                .grapheme_ids
+                .get(grapheme)
+                .and_then(|&id| self.trie.child(node, id));
+            let Some(next) = next else {
+                return 1;
+            };
+            node = next;
+        }
+        match self.trie.term[node as usize] {
+            0 => 1,
+            frequency => frequency,
+        }
     }
 
-    fn frequency_of(word: &str, trie: &Trie, graphemes: &[String]) -> u64 {
-        let mut node = 0u32;
-        let mut any = false;
-        for g in UnicodeSegmentation::graphemes(word, true) {
-            if let Some(pos) = graphemes.iter().position(|x| x == g) {
-                let Some(next) = trie.child(node, pos as u16) else {
-                    return 1;
-                };
-                node = next;
-                any = true;
-            } else {
-                return 1;
-            }
+    /// Language-model probability of `word` after `context`: the trigram
+    /// tier when two context words are available, else the bigram tier.
+    fn context_probability(&self, context: &[&str], word: &str) -> Option<f64> {
+        if let (Some(model), [.., p2, p1]) = (&self.trigram_language_model, context) {
+            return Some(model.probability(
+                &normalize_cow(p2.trim()),
+                &normalize_cow(p1.trim()),
+                word,
+            ));
         }
-        if any && node != 0 {
-            trie.term[node as usize]
-        } else {
-            1
+        match (&self.language_model, context.last()) {
+            (Some(model), Some(previous)) => {
+                Some(model.probability_normalized(&normalize_cow(previous.trim()), word))
+            }
+            _ => None,
         }
     }
 
@@ -1515,5 +1547,86 @@ mod tests {
         let corrector = test_corrector();
         assert!(corrector.suggest("").is_empty());
     }
-}
 
+    fn roman_corrector() -> Corrector {
+        Corrector::from_entries([
+            WordEntry::new("সোনার", 60),
+            WordEntry::new("উনার", 40),
+            WordEntry::new("সবার", 200),
+            WordEntry::new("আনার", 70),
+            WordEntry::new("বাংলা", 100),
+        ])
+        .unwrap()
+    }
+
+    fn graphemes(word: &str) -> Vec<String> {
+        UnicodeSegmentation::graphemes(word, true)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn suggest_input_reports_real_edit_costs_for_roman_hits() {
+        let corrector = roman_corrector();
+        let query = SuggestionInput::with_roman("sonar", "সনার", InputMode::Avro);
+        let results = corrector.suggest_input(&query, 10);
+        assert!(results.iter().any(|s| s.roman_cost.is_some()));
+        for suggestion in &results {
+            assert_eq!(
+                suggestion.edit_cost,
+                weighted_osa_distance(
+                    &graphemes("সনার"),
+                    &graphemes(&suggestion.word),
+                    &EditCosts::default()
+                ),
+                "{}",
+                suggestion.word
+            );
+        }
+    }
+
+    #[test]
+    fn suggest_input_roman_cost_is_a_penalty() {
+        let query = SuggestionInput::with_roman("sonar", "সনার", InputMode::Avro);
+        let with_weight = |roman_weight| {
+            roman_corrector()
+                .with_config(CorrectionConfig {
+                    roman_weight,
+                    ..CorrectionConfig::default()
+                })
+                .suggest_input(&query, 10)
+        };
+        let light = with_weight(1.0);
+        let heavy = with_weight(2.0);
+        for suggestion in &heavy {
+            let baseline = light.iter().find(|s| s.word == suggestion.word).unwrap();
+            assert!(
+                suggestion.score >= baseline.score,
+                "{}: a larger roman_weight must not improve the score",
+                suggestion.word
+            );
+        }
+        let lower_is_better = heavy
+            .windows(2)
+            .filter(|pair| pair[0].edit_cost == pair[1].edit_cost)
+            .filter(|pair| pair[0].frequency == pair[1].frequency)
+            .all(|pair| pair[0].roman_cost <= pair[1].roman_cost);
+        assert!(lower_is_better);
+    }
+
+    #[test]
+    fn suggest_input_without_roman_matches_bangla_api() {
+        let corrector = roman_corrector();
+        for query in [
+            SuggestionInput::bangla_only("সনার"),
+            SuggestionInput::with_roman("sonar", "সনার", InputMode::Bangla),
+        ] {
+            let words: Vec<String> = corrector
+                .suggest_input(&query, 5)
+                .into_iter()
+                .map(|s| s.word)
+                .collect();
+            assert_eq!(words, corrector.suggest_with("সনার", 5));
+        }
+    }
+}

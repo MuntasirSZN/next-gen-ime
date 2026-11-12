@@ -131,6 +131,20 @@ mod tests {
     }
 
     #[test]
+    fn suggest_input_ranks_the_closest_roman_match_first() {
+        let corrector = corrector();
+        for (roman, bangla, mode, expected) in [
+            ("sonar", "সনার", InputMode::Avro, "সোনার"),
+            ("bangla", "বাংলা", InputMode::Avro, "বাংলা"),
+            ("kintu", "কিন্তু", InputMode::Avro, "কিন্তু"),
+        ] {
+            let query = SuggestionInput::with_roman(roman, bangla, mode);
+            let top = corrector.suggest_input(&query, 5);
+            assert_eq!(top.first().map(|s| s.word.as_str()), Some(expected), "{roman}: {top:?}");
+        }
+    }
+
+    #[test]
     fn typo_tolerant_lookup_recovers_a_plausible_spelling() {
         let corrector = corrector();
         assert!(

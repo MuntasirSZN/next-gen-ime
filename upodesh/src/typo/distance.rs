@@ -1,7 +1,5 @@
-#[cfg(test)]
 use super::EditCosts;
 
-#[cfg(test)]
 const INF: u16 = u16::MAX;
 
 /// Weighted optimal-string-alignment distance (restricted Damerau-Levenshtein)
@@ -9,10 +7,9 @@ const INF: u16 = u16::MAX;
 /// unrestricted Damerau-Levenshtein, a substring cannot be edited repeatedly
 /// through overlapping transpositions.
 ///
-/// The FST automaton already tracks this exact distance during traversal
-/// (see `WeightedDamerauState::cost`). This function remains as the
-/// brute-force reference used by tests to validate the automaton.
-#[cfg(test)]
+/// The trie automaton tracks this exact distance during traversal; tests use
+/// this function as the brute-force reference for it. `suggest_input` also
+/// calls it to score words that only the Roman index found.
 pub(crate) fn weighted_osa_distance(
     query: &[String],
     candidate: &[String],
