@@ -87,6 +87,20 @@ custom index is possible with `Corrector::from_entries`, `with_edit_costs`,
 For performance numbers, see `examples/percentiles.rs` (p50/p95/p99 against
 the 5–15 µs readiness target).
 
+## GUI demo
+
+`gui/` holds an interactive, IME-style demo built with iced. You type Roman text
+(Avro or Khipro, converted by `okkhor`), see the Bangla preedit and the ranked
+`suggest_input` / `complete_prefix` results, adjust every `CorrectionConfig`
+and `EditCosts` setting live, and watch per-keystroke latency and heap usage:
+
+```sh
+cargo run --release --manifest-path gui/Cargo.toml
+```
+
+It uses Kohinoor Bangla on macOS or Noto Sans Bengali on Linux; set
+`UPODESH_FONT` and `UPODESH_FONT_FAMILY` to use another font.
+
 ## Development
 
 ```sh

@@ -1,0 +1,16 @@
+[package]
+name = "upodesh-gui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+upodesh = { path = ".." }
+iced = "0.13.1"
+okkhor = { version = "0.10", features = ["khipro"] }
+peak_alloc = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

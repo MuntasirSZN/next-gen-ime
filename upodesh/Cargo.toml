@@ -5,7 +5,7 @@ version = "0.4.1"
 license = "MIT"
 repository = "https://github.com/OpenBangla/upodesh"
 keywords = ["unicode", "bengali", "suggestion"]
-exclude = ["generate", "generate/*", "bencher", "bencher/*"]
+exclude = ["generate", "generate/*", "gui", "gui/*", "bencher", "bencher/*"]
 edition = "2024"
 rust-version = "1.91.0"
 

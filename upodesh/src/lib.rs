@@ -33,19 +33,28 @@ fn empty_corrector() -> &'static Corrector {
     })
 }
 
+/// Load an owned copy of the embedded index, e.g. to apply a custom
+/// `CorrectionConfig` or `EditCosts` through the `with_*` builders.
+///
+/// Each call decodes the embedded blob again; use [`corrector`] for the
+/// shared default instance.
+pub fn load_embedded() -> Result<Corrector, BuildError> {
+    Corrector::from_bytes(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/dictionary.index"
+    )))
+}
+
 /// Return the shared correction index.
 ///
-/// The embedded FST blob is streamed once into the grapheme trie on first
-/// use; there is no dictionary parse after that. If the embedded index is
+/// The embedded blob is decoded once into the grapheme trie on first use;
+/// there is no dictionary parse after that. If the embedded index is
 /// unreadable, returns an empty index instead of panicking.
 pub fn corrector() -> &'static Corrector {
     if let Some(c) = CORRECTOR.get() {
         return c;
     }
-    match Corrector::from_bytes(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/dictionary.index"
-    ))) {
+    match load_embedded() {
         Ok(c) => CORRECTOR.get_or_init(|| c),
         Err(_) => empty_corrector(),
     }
